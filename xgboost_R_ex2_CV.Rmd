@@ -1,0 +1,242 @@
+---
+title: "XGBoost Example 2"
+author: "Rupert Thomas"
+date: "Saturday, January 23, 2016"
+output: html_document
+---
+
+Example using the XGBoost library for Extreme Gradient Boosting decision trees, with cross-validation.
+
+With lots of inspiration (on setting up the cross-validation) from:
+Practical Machine Learning Project
+Soesilo Wijono
+https://rpubs.com/flyingdisc/practical-machine-learning-xgboost
+
+This example was developed using the data from the Homesite Quote competition on Kaggle:
+https://www.kaggle.com/c/homesite-quote-conversion
+
+The code however is reasonably generic for any problem of the same type (prediction of a binary response variable from a multivariate set of mixed data). 
+
+```{r}
+# Load libraries and initial config
+library(xgboost)
+library(readr)
+library(stringr)
+library(caret)
+library(car)
+
+set.seed(100)     # Set random seed for reproduceable results
+
+training_dataset_filename = "train.csv"
+test_dataset_filename = "test.csv"
+
+response_label = 'QuoteConversion_Flag'   # The variable name (in the training set) that contains the response
+id_label = 'QuoteNumber'
+
+# Identify non-trainable data fields
+nonTrainableFields = c('Original_Quote_Date')
+
+```
+
+```{r} 
+# Load dataset (Loan Prediction Challenge, Kaggle)
+
+
+# load data
+df_train = read_csv(training_dataset_filename)
+df_test = read_csv(test_dataset_filename)
+
+# Separate response labels from training data
+response = df_train[[response_label]]
+
+# Identify origination
+df_train$train_test = 1
+df_test$train_test = 2
+
+# combine train and test data, without response field
+df_all = rbind(df_train[-grep(response_label, colnames(df_train))],df_test)
+
+```
+
+```{r}
+# Data cleaning
+
+# Convert and NAN to NA
+df_all[ is.na(df_all) ] <- NA
+
+# Setup regex to identify blanks,spaces
+pat <- "^[[:space:]]*$"
+
+# Iterate through the fields
+colTypes = lapply(df_all,class)
+colNames = colnames(df_all)
+for (i in seq(1,length(colNames))) {
+  
+  # Identify blanks or spaces and replace with NA
+  blankEntries = grepl(pat, df_all[[colNames[i]]])
+  if (any(blankEntries)) {
+    message(paste(toString(sum(blankEntries)), ' empty fields in column ', colNames[i], ' replaced with NA'))
+    df_all[blankEntries,colNames[i]] = NA
+  }
+  
+  # For the character fields convert to boolean or integer categories
+  if (colTypes[i] == "character") {
+    uniqueFields = unique(df_all[[colNames[i]]])
+    uniqueFields = uniqueFields[!is.na(uniqueFields)] # strip away NAs for this bit
+    
+    if ((length(uniqueFields)==2) & (any(uniqueFields=="Y") | any(uniqueFields=="y")) & (any(uniqueFields=="N" ) | any(uniqueFields=="n"))) {
+      # Convert character with Y,y,N,n to boolean
+      message(paste('Converting field ', colNames[i], ' to integer boolean'))
+      bYesFields = (df_all[colNames[i]] == "Y") | (df_all[colNames[i]] == "y")
+      bYesFields[is.na(bYesFields)] = F
+      bNoFields = (df_all[colNames[i]] == "N")|  (df_all[colNames[i]] == "n")
+      bNoFields[is.na(bNoFields)] = F
+      df_all[bYesFields,colNames[i]] = 1
+      df_all[bNoFields,colNames[i]] = 0
+      df_all[colNames[i]] = as.integer(df_all[[colNames[i]]]) # force to integer
+    }
+    
+    else {      
+    # Convert character field to integer factor
+      theseLevels=unique(df_all[[colNames[i]]])
+      message(paste('Converting field ', colNames[i], ' to integer factor, ', length(theseLevels), ' levels: ', toString(theseLevels)))
+      convertedToIntFactor = as.integer(factor(df_all[[colNames[i]]], exclude=NULL, levels=))
+      convertedToIntFactor[is.na(df_all[[colNames[i]]])] = NA    # Restore missing data for now (DO NOT store as int!)
+      df_all[colNames[i]] = convertedToIntFactor
+    }
+  }
+}
+
+
+```
+
+```{r}
+
+# Missing Data
+
+# Get counts of columns with missing data
+na_count <-sapply(df_all, function(y) sum(length(which(is.na(y)))))
+if (any(na_count != 0)) {
+  message('Missing data found in the following fields (totals):')
+  na_count[names(which(na_count != 0))]
+}
+
+## Decide what to do here about missing data
+# Option 1: Leave as it is
+# Do nothing, as XGBoost is quite robust to missing data
+
+# # Option 2: Remove columns with NA, use test data as referal for NA
+# cols.without.na = colSums(is.na(df_all)) == 0
+# df_all = df_all[, cols.without.na]
+
+# Generate a discrete response variable (if it is not already)
+response_discrete = as.integer(response != 0)
+
+```
+
+```{r}
+# Prepare for training the algorithm
+
+# Split combined dataset back into train and test
+X_train = df_all[df_all$train_test==1,]
+X_test  = df_all[df_all$train_test==2,]
+
+rownames(X_test) <- NULL
+
+# Remove non-useful data
+drops = c(nonTrainableFields, id_label, 'train_test')
+X_train = X_train[,!(names(X_train) %in% drops)]
+X_test = X_test[,!(names(X_test) %in% drops)]
+
+# Put all into matrix form
+X_train = as.matrix(X_train)
+X_test = as.matrix(X_test)
+y = as.matrix(response_discrete)
+
+```
+
+```{r}
+# Tune and Run the model
+
+params2 = list(
+ objective = "binary:logistic", #"multi:softprob",
+ #eval_metric = "merror",
+ #num_class = 2,
+ eta = 0.3,    # step size shrinkage 
+ gamma = 0,    # minimum loss reduction 
+ max_depth = 15,    # maximum depth of tree
+ #nround=25, 
+ subsample = 1,   # part of data instances to grow tree
+ colsample_bytree = 1, # subsample ratio of columns when constructing each tree 
+ min_child_weight = 12,  # minimum sum of instance weight needed in a child
+ #nthread = 6,
+ missing = "NA"
+)
+
+# Run cross-validation
+nrounds.cv = 100
+set.seed(100)
+cv_results <- xgb.cv(data = X_train, params=params2, label = y,
+               nfold=4, nrounds=nrounds.cv, missing = "NA", prediction=TRUE)#, verbose=FALSE)
+
+# Plot results of cross-validation
+cv_results$dt$idx = 1:nrounds.cv
+ggplot(data=cv_results$dt,aes()) + geom_line(aes(x=idx,y=test.error.mean), colour='red') +
+geom_line(aes(x=idx,y=train.error.mean), colour='blue') + xlab('Epoch') + ylab('Error') + ggtitle('Cross-validation Performance')
+
+# Find best result
+min_error_idx = which.min(cv_results$dt[,test.error.mean])
+min_error = cv_results$dt[min_error_idx,test.error.mean]
+
+```
+
+```{r}
+# Run final
+set.seed(100)
+xgb <- xgboost(data = X_train, params=params2, label = y,
+               nrounds=min_error_idx, missing = "NA", prediction=TRUE)#, verbose=FALSE)
+```
+
+
+
+
+```{r}
+#Score the test population
+
+# predict values in test set
+y_pred <- predict(xgb, X_test, missing = "NA")
+
+# Create output file
+submission = df_test[id_label]
+submission[response_label] = y_pred
+
+filename = paste0("Prediction_",Sys.time(),'.csv')
+filename = gsub(':','',filename)
+filename = gsub('-','',filename)
+filename = gsub(' ','',filename)
+filename
+write.csv(submission, file=filename, quote=FALSE, row.names=FALSE, col.names=TRUE)
+
+```
+
+
+
+```{r}
+# Analysis of the XGBoost model produced
+
+# Lets start with finding what the actual tree looks like
+model <- xgb.dump(xgb, with.stats = T)
+model[1:10] #This statement prints top 10 nodes of the model
+
+# Get the feature real names
+names <- dimnames(data.matrix(X_test))[[2]]
+
+# Compute feature importance matrix
+importance_matrix <- xgb.importance(names, model = xgb)
+
+# Nice graph
+xgb.plot.importance(importance_matrix[1:10,])
+
+#In case of a version issue, try the following :
+barplot(importance_matrix[,1])
+```
